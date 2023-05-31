@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -14,20 +15,21 @@ import (
 )
 
 var (
-	port = flag.Int("port", 8090, "load balancer port")
+	port       = flag.Int("port", 8090, "load balancer port")
 	timeoutSec = flag.Int("timeout-sec", 3, "request timeout time in seconds")
-	https = flag.Bool("https", false, "whether backends support HTTPs")
+	https      = flag.Bool("https", false, "whether backends support HTTPs")
 
 	traceEnabled = flag.Bool("trace", false, "whether to include tracing information into responses")
 )
 
 var (
-	timeout = time.Duration(*timeoutSec) * time.Second
+	timeout     = time.Duration(*timeoutSec) * time.Second
 	serversPool = []string{
 		"server1:8080",
 		"server2:8080",
 		"server3:8080",
 	}
+	activeServers = make([]string, len(serversPool))
 )
 
 func scheme() string {
@@ -38,7 +40,9 @@ func scheme() string {
 }
 
 func health(dst string) bool {
-	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("%s://%s/health", scheme(), dst), nil)
 	resp, err := http.DefaultClient.Do(req)
@@ -52,7 +56,9 @@ func health(dst string) bool {
 }
 
 func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
-	ctx, _ := context.WithTimeout(r.Context(), timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
 	fwdRequest := r.Clone(ctx)
 	fwdRequest.RequestURI = ""
 	fwdRequest.URL.Host = dst
@@ -88,22 +94,47 @@ func main() {
 	flag.Parse()
 
 	// TODO: Використовуйте дані про стан сервреа, щоб підтримувати список тих серверів, яким можна відправляти ззапит.
-	for _, server := range serversPool {
-		server := server
-		go func() {
-			for range time.Tick(10 * time.Second) {
-				log.Println(server, health(server))
-			}
-		}()
-	}
+	checkServersHealth(serversPool, activeServers)
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Рееалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		forward(activeServers[getServerIndexByAddress(r.RemoteAddr)], rw, r)
 	}))
 
 	log.Println("Starting load balancer...")
 	log.Printf("Tracing support enabled: %t", *traceEnabled)
 	frontend.Start()
 	signal.WaitForTerminationSignal()
+}
+
+func getServerIndexByAddress(addr string) int {
+	hashed := encryptAddress(addr)
+	serverIndex := int(hashed) % len(activeServers)
+	return serverIndex
+}
+
+func encryptAddress(addr string) uint32 {
+	hash := fnv.New32()
+	_, err := hash.Write([]byte(addr))
+	if err != nil {
+		log.Printf("Failed to compute hash: %s", err)
+		return 0
+	}
+	return hash.Sum32()
+}
+
+func checkServersHealth(servers []string, result []string) {
+	for i, server := range servers {
+		startHealthMonitoring(server, i, result)
+	}
+}
+
+func startHealthMonitoring(server string, index int, result []string) {
+	go func() {
+		for range time.Tick(10 * time.Second) {
+			if health(server) {
+				result[index] = server
+			}
+			log.Println(server, health(server))
+		}
+	}()
 }
