@@ -118,7 +118,7 @@ func Forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
-func Main() {
+func main() {
 	
 	flag.Parse()
 	CheckServersHealth(serversPool, activeServers)
