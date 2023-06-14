@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/AlinaDubchak/Lab4-Go/httptools"
@@ -30,21 +31,48 @@ var (
 		"server3:8080",
 	}
 	activeServers = make([]string, len(serversPool))
+	healthChecker = &HealthChecker{}
 )
 
-func scheme() string {
+type HealthChecker struct {
+	serverHealthStatus map[string]bool
+	health             func(dst string) bool
+	mu             sync.Mutex
+}
+
+func (hc *HealthChecker) CheckAllServers() {
+	for _, server := range serversPool {
+		if hc.health(server) {
+			hc.serverHealthStatus[server] = true
+		} else {
+			hc.serverHealthStatus[server] = false
+		}
+	}
+}
+
+func (hc *HealthChecker) GetHealthyServers() []string {
+	var healthyServers []string
+	for _, server := range serversPool {
+		if hc.serverHealthStatus[server] {
+			healthyServers = append(healthyServers, server)
+		}
+	}
+	return healthyServers
+}
+
+func Scheme() string {
 	if *https {
 		return "https"
 	}
 	return "http"
 }
 
-func health(dst string) bool {
+func Health(dst string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, "GET",
-		fmt.Sprintf("%s://%s/health", scheme(), dst), nil)
+		fmt.Sprintf("%s://%s/health", Scheme(), dst), nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false
@@ -55,14 +83,14 @@ func health(dst string) bool {
 	return true
 }
 
-func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
+func Forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	fwdRequest := r.Clone(ctx)
 	fwdRequest.RequestURI = ""
 	fwdRequest.URL.Host = dst
-	fwdRequest.URL.Scheme = scheme()
+	fwdRequest.URL.Scheme = Scheme()
 	fwdRequest.Host = dst
 
 	resp, err := http.DefaultClient.Do(fwdRequest)
@@ -90,14 +118,17 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
-func main() {
+func Main() {
+	
 	flag.Parse()
-
-	// TODO: Використовуйте дані про стан сервреа, щоб підтримувати список тих серверів, яким можна відправляти ззапит.
-	checkServersHealth(serversPool, activeServers)
+	CheckServersHealth(serversPool, activeServers)
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		forward(activeServers[getServerIndexByAddress(r.RemoteAddr)], rw, r)
+		healthChecker.mu.Lock()
+		server := activeServers[len(serversPool)]
+		healthChecker.mu.Unlock()
+		_ =Forward(server, rw, r)
+		Forward(server, rw, r)
 	}))
 
 	log.Println("Starting load balancer...")
@@ -106,13 +137,13 @@ func main() {
 	signal.WaitForTerminationSignal()
 }
 
-func getServerIndexByAddress(addr string) int {
-	hashed := encryptAddress(addr)
+func GetServerIndexByAddress(addr string) int {
+	hashed := EncryptAddress(addr)
 	serverIndex := int(hashed) % len(activeServers)
 	return serverIndex
 }
 
-func encryptAddress(addr string) uint32 {
+func EncryptAddress(addr string) uint32 {
 	hash := fnv.New32()
 	_, err := hash.Write([]byte(addr))
 	if err != nil {
@@ -122,19 +153,27 @@ func encryptAddress(addr string) uint32 {
 	return hash.Sum32()
 }
 
-func checkServersHealth(servers []string, result []string) {
+func CheckServersHealth(servers []string, result []string) {
 	for i, server := range servers {
-		startHealthMonitoring(server, i, result)
+		StartHealthMonitoring(server, i, result)
 	}
 }
 
-func startHealthMonitoring(server string, index int, result []string) {
+func StartHealthMonitoring(server string, index int, result []string) {
 	go func() {
 		for range time.Tick(10 * time.Second) {
-			if health(server) {
+			if Health(server) {
 				result[index] = server
 			}
-			log.Println(server, health(server))
+			healthChecker.mu.Lock()
+			activeServers = activeServers[:0]
+			for _, value := range serversPool {
+				if value != "" {
+					activeServers = append(activeServers, value)
+				}
+			}
+			healthChecker.mu.Unlock()
+			log.Println(server, Health(server))
 		}
 	}()
 }
